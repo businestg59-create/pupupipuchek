@@ -3564,6 +3564,23 @@ async def handle_receipt_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         fire_and_forget(asyncio.create_task(track_event_bg(user.id, user.username, "receipt_request")))
         result = prefetched_result or analyze_pdf_structured(tmp_path)
+        summary = result.critical_fields_summary or {}
+        logger.info(
+            "PDF receipt flow structured result verdict=%s edit_score=%s template_score=%s amount_found=%s date_found=%s time_found=%s status_found=%s operation_id_found=%s core_supporting=%s critical_found=%s tx_context=%s limitations=%s file=%s",
+            result.verdict_status,
+            result.edit_score,
+            result.template_suspicion_score,
+            int(bool(summary.get("amount_found"))),
+            int(bool(summary.get("date_found"))),
+            int(bool(summary.get("time_found"))),
+            int(bool(summary.get("status_found"))),
+            int(bool(summary.get("operation_id_found"))),
+            int(summary.get("core_supporting_fields_count", 0) or 0),
+            int(summary.get("critical_fields_found_count", 0) or 0),
+            int(bool(summary.get("transaction_context_present"))),
+            ",".join(result.limitations or []),
+            os.path.basename(tmp_path),
+        )
         inviter_user_id = await mark_referral_qualified_and_reward(user.id)
 
         await status.edit_text(
