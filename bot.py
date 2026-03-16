@@ -695,6 +695,91 @@ def build_receipt_result_text(result_text: str, access: dict) -> str:
     return f"{result_text}\n\n🧾 Доступно проверок чеков: {access['quota']}"
 
 
+def render_pdf_result_message(result: "PdfAnalysisResult", access: dict) -> str:
+    status = safe_str(result.verdict_status) or "inconclusive"
+    header_map = {
+        "edited": "❌ <b>Высокий риск редактирования</b>",
+        "suspicious": "🔴 <b>Повышенный риск</b>",
+        "inconclusive": "🟠 <b>Нужна дополнительная проверка</b>",
+        "clean": "🟢 <b>Низкий риск</b>",
+    }
+    header = header_map.get(status, header_map["inconclusive"])
+
+    summary = result.critical_fields_summary or {}
+    reasons_set = {safe_str(r) for r in (result.verdict_reasons or []) if safe_str(r)}
+    comments: list[str] = []
+    comments_seen: set[str] = set()
+
+    def add_comment(text: str):
+        normalized = normalize_text_for_match(text)
+        if not normalized or normalized in comments_seen:
+            return
+        comments_seen.add(normalized)
+        comments.append(text)
+
+    limitation_set = set(result.limitations or [])
+    # 1) reason-aware комментарии (высший приоритет).
+    if reasons_set.intersection({"high_edit_score", "strong_forensic_combo"}):
+        add_comment("Обнаружены признаки возможного вмешательства в PDF")
+    if reasons_set.intersection({"template_semantic_suspicion", "suspicious_structure_or_semantics"}):
+        add_comment("Структура или набор реквизитов выглядят нетипично слабо")
+    has_limitation_reason = bool(
+        reasons_set.intersection({"severe_limitation", "low_analysis_confidence", "insufficient_text_context", "image_or_mixed_low_text_confidence"})
+    )
+    if has_limitation_reason:
+        add_comment("Анализ ограничен по качеству извлечённых данных")
+    if "insufficient_confidence_for_clean" in reasons_set:
+        add_comment("Данных недостаточно для полностью уверенного вывода")
+
+    # 2) Конфликты и частичное извлечение.
+    if summary.get("conflicting_amount_candidates") or summary.get("conflicting_date_candidates"):
+        add_comment("Обнаружены конфликтующие сумма или дата")
+    if "limited_text_extraction" in limitation_set and not has_limitation_reason:
+        add_comment("PDF распознан частично")
+
+    # 3) Вторичные информативные комментарии.
+    found_fields = []
+    if summary.get("amount_found"):
+        found_fields.append("сумма")
+    if summary.get("date_found"):
+        found_fields.append("дата")
+    if summary.get("time_found"):
+        found_fields.append("время")
+    if summary.get("status_found"):
+        found_fields.append("статус")
+    if summary.get("operation_id_found"):
+        found_fields.append("ID операции")
+    if found_fields:
+        add_comment("Найдены ключевые поля: " + ", ".join(found_fields[:5]))
+    if result.ocr_used:
+        add_comment("Для части страниц использовалось OCR")
+
+    # 4) Общий мягкий совет.
+    if status in {"edited", "suspicious", "inconclusive"}:
+        add_comment("Лучше запросить дополнительное подтверждение перевода")
+    elif status == "clean":
+        if limitation_set.intersection({"limited_text_extraction", "ocr_not_available", "ocr_low_text", "native_text_unavailable"}):
+            add_comment("Явных следов редактирования не найдено, но итог лучше сверять с фактом поступления")
+        else:
+            add_comment("Явных следов редактирования не найдено")
+
+    if len(comments) < 2:
+        add_comment("Итог лучше сверять с фактом поступления")
+    comments = comments[:4]
+
+    lines = [header, "", result.verdict, ""]
+    for item in comments:
+        lines.append(f"• {item}")
+
+    lines.append("")
+    if access["unlimited_active"]:
+        lines.append(f"♾️ Действует безлимит на проверку чеков до {format_access_until(access['unlimited_until'])}.")
+    else:
+        lines.append(f"🧾 Доступно проверок чеков: {access['quota']}")
+
+    return "\n".join(lines)
+
+
 async def build_invite_text(user_id: int, bot) -> str:
     referral_link = await get_personal_referral_link(bot, user_id)
     return (
@@ -924,22 +1009,26 @@ async def get_stats_text() -> str:
     assert _db_pool is not None
 
     async with _db_pool.acquire() as conn:
-        total_users, total_starts, total_card_requests, total_receipt_checks, today_row, users_with_invited_by, confirmed_referrals, referral_rewards_total, unlimited_rows = await asyncio.gather(
-            conn.fetchrow("SELECT COUNT(*) AS c FROM users"),
-            conn.fetchrow("SELECT COALESCE(SUM(starts),0) AS s FROM users"),
-            conn.fetchrow("SELECT COALESCE(SUM(requests),0) AS r FROM users"),
-            conn.fetchrow("SELECT COALESCE(SUM(receipt_checks),0) AS r FROM users"),
-            conn.fetchrow("SELECT starts, requests, unique_users, receipt_checks FROM daily WHERE day = $1", day),
-            conn.fetchrow("SELECT COUNT(*) AS c FROM users WHERE invited_by IS NOT NULL"),
-            conn.fetchrow("SELECT COUNT(*) AS c FROM referrals WHERE rewarded = 1"),
-            conn.fetchrow("SELECT COALESCE(SUM(reward_amount),0) AS s FROM referrals WHERE rewarded = 1"),
-            conn.fetch("SELECT unlimited_until FROM users WHERE unlimited_until IS NOT NULL"),
+        total_users = await conn.fetchrow("SELECT COUNT(*) AS c FROM users")
+        total_starts = await conn.fetchrow("SELECT COALESCE(SUM(starts),0) AS s FROM users")
+        total_card_requests = await conn.fetchrow("SELECT COALESCE(SUM(requests),0) AS r FROM users")
+        total_receipt_checks = await conn.fetchrow("SELECT COALESCE(SUM(receipt_checks),0) AS r FROM users")
+        today_row = await conn.fetchrow(
+            "SELECT starts, requests, unique_users, receipt_checks FROM daily WHERE day = $1",
+            day
         )
+        users_with_invited_by = await conn.fetchrow("SELECT COUNT(*) AS c FROM users WHERE invited_by IS NOT NULL")
+        confirmed_referrals = await conn.fetchrow("SELECT COUNT(*) AS c FROM referrals WHERE rewarded = 1")
+        referral_rewards_total = await conn.fetchrow(
+            "SELECT COALESCE(SUM(reward_amount),0) AS s FROM referrals WHERE rewarded = 1"
+        )
+        unlimited_rows = await conn.fetch("SELECT unlimited_until FROM users WHERE unlimited_until IS NOT NULL")
 
-    starts_today = int(today_row["starts"])
-    card_requests_today = int(today_row["requests"])
-    receipt_checks_today = int(today_row["receipt_checks"])
-    dau_today = int(today_row["unique_users"])
+    today_data = today_row or {"starts": 0, "requests": 0, "unique_users": 0, "receipt_checks": 0}
+    starts_today = int(today_data.get("starts") or 0)
+    card_requests_today = int(today_data.get("requests") or 0)
+    receipt_checks_today = int(today_data.get("receipt_checks") or 0)
+    dau_today = int(today_data.get("unique_users") or 0)
     active_unlimited_users = sum(1 for row in unlimited_rows if is_unlimited_active(row["unlimited_until"]))
 
     return (
@@ -1768,8 +1857,25 @@ def build_pdf_verdict(
     reasons = []
     limitation_set = set(limitations or [])
 
+    suspicious_critical_lines = int(critical_summary.get("suspicious_critical_lines_total", 0) or 0)
+    core_supporting = int(critical_summary.get("core_supporting_fields_count", 0) or 0)
+    critical_found = int(critical_summary.get("critical_fields_found_count", 0) or 0)
+    operation_id_found = bool(critical_summary.get("operation_id_found"))
+    transaction_context_present = bool(critical_summary.get("transaction_context_present"))
+    too_few_supporting = bool(critical_summary.get("too_few_supporting_fields"))
+    conflicting_amounts = bool(critical_summary.get("conflicting_amount_candidates"))
+    conflicting_dates = bool(critical_summary.get("conflicting_date_candidates"))
+
     if edit_score >= 7:
         reasons.append("high_edit_score")
+        return {
+            "verdict_status": "edited",
+            "verdict_text": "❌ Обнаружены признаки редактирования",
+            "reasons": reasons,
+        }
+    # Сильная forensic-комбинация даже ниже основного порога.
+    if edit_score >= 6 and suspicious_critical_lines >= 2:
+        reasons.extend(["strong_forensic_combo", "high_edit_score"])
         return {
             "verdict_status": "edited",
             "verdict_text": "❌ Обнаружены признаки редактирования",
@@ -1784,12 +1890,6 @@ def build_pdf_verdict(
             "reasons": reasons,
         }
 
-    core_supporting = int(critical_summary.get("core_supporting_fields_count", 0) or 0)
-    critical_found = int(critical_summary.get("critical_fields_found_count", 0) or 0)
-    operation_id_found = bool(critical_summary.get("operation_id_found"))
-    transaction_context_present = bool(critical_summary.get("transaction_context_present"))
-    too_few_supporting = bool(critical_summary.get("too_few_supporting_fields"))
-
     quality_flags = {
         "limited_text_extraction",
         "native_text_unavailable",
@@ -1797,6 +1897,13 @@ def build_pdf_verdict(
         "ocr_low_text",
     }
     quality_hits = len(limitation_set.intersection(quality_flags))
+    semantic_weak = (
+        core_supporting <= 1 or
+        critical_found <= 3 or
+        too_few_supporting or
+        (not transaction_context_present and not operation_id_found)
+    )
+    has_conflicts = conflicting_amounts or conflicting_dates
 
     if quality_hits >= 2 and core_supporting <= 1:
         reasons.append("low_analysis_confidence")
@@ -1806,7 +1913,12 @@ def build_pdf_verdict(
             "reasons": reasons,
         }
 
-    if receipt_format_type in {"image_pdf", "mixed_pdf"} and "limited_text_extraction" in limitation_set and core_supporting == 0:
+    if (
+        receipt_format_type in {"image_pdf", "mixed_pdf"} and
+        core_supporting == 0 and
+        not transaction_context_present and
+        ("limited_text_extraction" in limitation_set or quality_hits >= 1)
+    ):
         reasons.append("image_or_mixed_low_text_confidence")
         return {
             "verdict_status": "inconclusive",
@@ -1814,16 +1926,26 @@ def build_pdf_verdict(
             "reasons": reasons,
         }
 
+    if "limited_text_extraction" in limitation_set and core_supporting == 0 and not transaction_context_present:
+        reasons.append("insufficient_text_context")
+        return {
+            "verdict_status": "inconclusive",
+            "verdict_text": LIMITED_ANALYSIS_VERDICT_TEXT,
+            "reasons": reasons,
+        }
+
+    # Suspicious должен требовать комбинацию сигналов, а не один слабый индикатор.
     suspicious_combo = (
-        template_score >= 5 and
-        core_supporting <= 2 and
-        critical_found <= 4 and
-        (
-            too_few_supporting or
-            (not transaction_context_present and not operation_id_found)
-        )
+        template_score >= 5 and semantic_weak and (has_conflicts or critical_found <= 4 or not operation_id_found)
     )
-    if suspicious_combo and quality_hits == 0:
+    moderate_forensic_combo = (
+        (edit_score >= 4 and (template_score >= 3 or has_conflicts)) or
+        (edit_score >= 5 and semantic_weak)
+    )
+    suspicious_conflict_combo = (
+        has_conflicts and core_supporting <= 2 and (template_score >= 3 or suspicious_critical_lines >= 1)
+    )
+    if (suspicious_combo or moderate_forensic_combo or suspicious_conflict_combo) and quality_hits <= 1:
         reasons.append("template_semantic_suspicion")
         return {
             "verdict_status": "suspicious",
@@ -1831,9 +1953,29 @@ def build_pdf_verdict(
             "reasons": reasons,
         }
 
+    # Clean только при достаточном покрытии и отсутствии заметных рисков.
+    clean_ready = (
+        quality_hits == 0 and
+        core_supporting >= 3 and
+        critical_found >= 5 and
+        transaction_context_present and
+        edit_score <= 2 and
+        template_score <= 2 and
+        suspicious_critical_lines == 0 and
+        not too_few_supporting and
+        not has_conflicts
+    )
+    if clean_ready:
+        return {
+            "verdict_status": "clean",
+            "verdict_text": "✅ Признаков редактирования не обнаружено",
+            "reasons": reasons,
+        }
+
+    reasons.append("insufficient_confidence_for_clean")
     return {
-        "verdict_status": "clean",
-        "verdict_text": "✅ Признаков редактирования не обнаружено",
+        "verdict_status": "inconclusive",
+        "verdict_text": LIMITED_ANALYSIS_VERDICT_TEXT,
         "reasons": reasons,
     }
 
@@ -1885,6 +2027,29 @@ def is_pdf_receipt_like(file_path: str) -> bool:
         text = native_text.lower()
         format_type, format_stats = _detect_receipt_format_type(doc, native_text)
         hits, found_groups = _receipt_semantic_groups_hits(text) if text else (0, set())
+        entities = extract_receipt_entities(text) if text else extract_receipt_entities("")
+
+        core_semantic_hits = sum(
+            int(v) for v in (
+                bool(entities.get("amounts")),
+                bool(entities.get("currencies")),
+                bool(entities.get("dates")),
+                bool(entities.get("times")),
+                bool(entities.get("statuses")),
+                bool(entities.get("operation_ids")),
+                bool(entities.get("transaction_context_present")),
+            )
+        )
+        has_amount_context = bool(entities.get("amounts")) and any(
+            (
+                bool(entities.get("dates")),
+                bool(entities.get("times")),
+                bool(entities.get("operation_ids")),
+                bool(entities.get("transaction_context_present")),
+                bool(entities.get("statuses")),
+            )
+        )
+        is_document_like = _is_document_like_receipt_candidate(format_type, format_stats, text)
 
         if text and len(text) >= 20:
             # Strong rule: amount + one of core transactional context groups.
@@ -1895,16 +2060,77 @@ def is_pdf_receipt_like(file_path: str) -> bool:
             ):
                 return True
 
-            # Fallback rule: 3+ independent semantic groups.
-            if hits >= 3:
+            # Более строгий fallback: не только количество групп, но и транзакционная глубина.
+            if hits >= 3 and core_semantic_hits >= 2 and (
+                "amount" in found_groups or
+                "operation" in found_groups or
+                has_amount_context
+            ):
                 return True
 
-        # Weak text fallback: небольшая семантика + document-like структура.
-        if hits >= 2 and _is_document_like_receipt_candidate(format_type, format_stats, text):
-            return True
+        # text_pdf: допускаем мягче и в первую очередь смотрим на транзакционную семантику.
+        # Здесь не делаем жесткий structural reject, чтобы не терять валидные чеки с нестандартной версткой.
+        if format_type == "text_pdf":
+            strong_semantic_accept = (
+                core_semantic_hits >= 2 and
+                (has_amount_context or "operation" in found_groups or "receipt" in found_groups)
+            )
+            if strong_semantic_accept:
+                return True
 
-        # Low/no text fallback: только conservative document-like эвристика.
-        return _is_document_like_receipt_candidate(format_type, format_stats, text)
+            # Осторожный fallback для кривого text extraction:
+            # требуем сумму + комбинацию ключевых транзакционных сигналов.
+            has_amount = bool(entities.get("amounts")) or "amount" in found_groups
+            has_temporal = bool(entities.get("dates")) or bool(entities.get("times")) or "date_time" in found_groups
+            has_tx_context = (
+                bool(entities.get("transaction_context_present")) or
+                bool(entities.get("operation_ids")) or
+                "operation" in found_groups
+            )
+            has_status = bool(entities.get("statuses"))
+            has_receipt_group = "receipt" in found_groups
+
+            return (
+                has_amount and
+                hits >= 2 and
+                (
+                    (has_temporal and (has_tx_context or has_status)) or
+                    (has_tx_context and (has_status or has_receipt_group))
+                )
+            )
+
+        # mixed_pdf: недостаточно "похожести на документ"; нужна хотя бы минимальная семантика.
+        if format_type == "mixed_pdf":
+            if not is_document_like:
+                return False
+            if core_semantic_hits >= 2 and (has_amount_context or "operation" in found_groups):
+                return True
+            return hits >= 3 and core_semantic_hits >= 1 and ("receipt" in found_groups or "operation" in found_groups)
+
+        # image_pdf: самый строгий fallback, чтобы не пропускать произвольные image-only PDF.
+        # Разрешаем только при совокупности строгой структуры + хотя бы слабого транзакционного сигнала.
+        if format_type == "image_pdf":
+            if not is_document_like:
+                return False
+            pages_total = int(format_stats.get("pages_total", 0) or 0)
+            image_ratio = float(format_stats.get("image_page_ratio", 0.0) or 0.0)
+            pages_with_text_blocks = int(format_stats.get("pages_with_text_blocks", 0) or 0)
+            total_image_blocks = int(format_stats.get("total_image_blocks", 0) or 0)
+            strict_image_structure = (
+                pages_total <= 2 and
+                image_ratio >= 0.85 and
+                pages_with_text_blocks == 0 and
+                1 <= total_image_blocks <= 6
+            )
+            return strict_image_structure and (
+                core_semantic_hits >= 1 and (
+                    has_amount_context or
+                    "operation" in found_groups or
+                    "receipt" in found_groups
+                )
+            )
+
+        return False
     except Exception:
         logger.exception("Ошибка pre-check PDF")
         return False
@@ -2529,19 +2755,11 @@ def _build_limitations(
 ) -> list[str]:
     limitations = []
     native_len = len(safe_str(native_text).strip())
+    effective_len = len(safe_str(effective_text).strip())
     if format_type == "image_pdf":
         limitations.append("image_based_pdf")
     if not native_text.strip():
         limitations.append("native_text_unavailable")
-    if ocr_needed and not ocr_info.get("ocr_available", False):
-        limitations.append("ocr_not_available")
-    if ocr_info.get("ocr_used", False):
-        limitations.append("ocr_used")
-
-    for item in ocr_info.get("ocr_limitations", []):
-        if item not in limitations:
-            limitations.append(item)
-
     semantic_depth = sum(
         int(v) for v in (
             bool(entities.get("amounts")),
@@ -2553,7 +2771,20 @@ def _build_limitations(
             bool(entities.get("transaction_context_present")),
         )
     )
-    if len(safe_str(effective_text)) < 24 or semantic_depth == 0:
+
+    # OCR-недоступность считаем значимой только когда действительно не хватает текста/семантики.
+    weak_text_or_semantics = (effective_len < 36) or (semantic_depth <= 1)
+    image_or_mixed_weak = format_type in {"image_pdf", "mixed_pdf"} and (effective_len < 60 or semantic_depth <= 2)
+    if ocr_needed and not ocr_info.get("ocr_available", False) and (weak_text_or_semantics or image_or_mixed_weak):
+        limitations.append("ocr_not_available")
+    if ocr_info.get("ocr_used", False):
+        limitations.append("ocr_used")
+
+    for item in ocr_info.get("ocr_limitations", []):
+        if item not in limitations:
+            limitations.append(item)
+
+    if effective_len < 24 or semantic_depth == 0:
         limitations.append("limited_text_extraction")
     return limitations
 
@@ -2772,16 +3003,25 @@ def analyze_pdf_structured(file_path: str) -> PdfAnalysisResult:
         verdict = verdict_info["verdict_text"]
 
         logger.info(
-            "PDF final verdict=%s edit_score=%s template_score=%s format=%s native_len=%s ocr_used=%s ocr_processed=%s ocr_with_text=%s ocr_len=%s limitations=%s file=%s",
+            "PDF final verdict=%s reasons=%s edit_score=%s template_score=%s core_supporting=%s critical_found=%s suspicious_critical_lines=%s too_few_supporting=%s conflicting_amount=%s conflicting_date=%s operation_id_found=%s tx_context=%s format=%s native_len=%s ocr_used=%s ocr_len=%s ocr_processed=%s ocr_with_text=%s limitations=%s file=%s",
             verdict_status,
+            ",".join(verdict_reasons[:5]) if verdict_reasons else "-",
             score,
             template_suspicion_score,
+            int(critical_summary.get("core_supporting_fields_count", 0) or 0),
+            int(critical_summary.get("critical_fields_found_count", 0) or 0),
+            int(critical_summary.get("suspicious_critical_lines_total", 0) or 0),
+            int(bool(critical_summary.get("too_few_supporting_fields"))),
+            int(bool(critical_summary.get("conflicting_amount_candidates"))),
+            int(bool(critical_summary.get("conflicting_date_candidates"))),
+            int(bool(critical_summary.get("operation_id_found"))),
+            int(bool(critical_summary.get("transaction_context_present"))),
             receipt_format_type,
             len(native_text),
             int(ocr_used),
+            ocr_text_length,
             ocr_pages_processed,
             ocr_pages_with_text,
-            ocr_text_length,
             ",".join(limitations[:4]),
             os.path.basename(file_path),
         )
@@ -3223,10 +3463,13 @@ async def handle_receipt_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         status = await update.message.reply_text("⏳ Проверяю PDF...")
         fire_and_forget(asyncio.create_task(track_event_bg(user.id, user.username, "receipt_request")))
-        result = analyze_pdf(tmp_path)
+        result = analyze_pdf_structured(tmp_path)
         inviter_user_id = await mark_referral_qualified_and_reward(user.id)
 
-        await status.edit_text(build_receipt_result_text(result, access))
+        await status.edit_text(
+            render_pdf_result_message(result, access),
+            parse_mode="HTML"
+        )
 
         if inviter_user_id:
             await notify_inviter_reward(context.bot, inviter_user_id, REFERRAL_REWARD_AMOUNT)
