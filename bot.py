@@ -1900,6 +1900,8 @@ def build_pdf_verdict(
 ) -> dict:
     reasons = []
     limitation_set = set(limitations or [])
+    strict_clean_ready = False
+    relaxed_clean_ready = False
 
     suspicious_critical_lines = int(critical_summary.get("suspicious_critical_lines_total", 0) or 0)
     core_supporting = int(critical_summary.get("core_supporting_fields_count", 0) or 0)
@@ -1916,6 +1918,8 @@ def build_pdf_verdict(
             "verdict_status": "edited",
             "verdict_text": "❌ Обнаружены признаки редактирования",
             "reasons": reasons,
+            "strict_clean_ready": strict_clean_ready,
+            "relaxed_clean_ready": relaxed_clean_ready,
         }
     # Сильная forensic-комбинация даже ниже основного порога.
     if edit_score >= 6 and suspicious_critical_lines >= 2:
@@ -1924,6 +1928,8 @@ def build_pdf_verdict(
             "verdict_status": "edited",
             "verdict_text": "❌ Обнаружены признаки редактирования",
             "reasons": reasons,
+            "strict_clean_ready": strict_clean_ready,
+            "relaxed_clean_ready": relaxed_clean_ready,
         }
 
     if "analysis_error" in limitation_set or "pdf_too_large" in limitation_set:
@@ -1932,6 +1938,8 @@ def build_pdf_verdict(
             "verdict_status": "inconclusive",
             "verdict_text": LIMITED_ANALYSIS_VERDICT_TEXT,
             "reasons": reasons,
+            "strict_clean_ready": strict_clean_ready,
+            "relaxed_clean_ready": relaxed_clean_ready,
         }
 
     quality_flags = {
@@ -1955,6 +1963,8 @@ def build_pdf_verdict(
             "verdict_status": "inconclusive",
             "verdict_text": LIMITED_ANALYSIS_VERDICT_TEXT,
             "reasons": reasons,
+            "strict_clean_ready": strict_clean_ready,
+            "relaxed_clean_ready": relaxed_clean_ready,
         }
 
     if (
@@ -1968,6 +1978,8 @@ def build_pdf_verdict(
             "verdict_status": "inconclusive",
             "verdict_text": LIMITED_ANALYSIS_VERDICT_TEXT,
             "reasons": reasons,
+            "strict_clean_ready": strict_clean_ready,
+            "relaxed_clean_ready": relaxed_clean_ready,
         }
 
     if "limited_text_extraction" in limitation_set and core_supporting == 0 and not transaction_context_present:
@@ -1976,6 +1988,8 @@ def build_pdf_verdict(
             "verdict_status": "inconclusive",
             "verdict_text": LIMITED_ANALYSIS_VERDICT_TEXT,
             "reasons": reasons,
+            "strict_clean_ready": strict_clean_ready,
+            "relaxed_clean_ready": relaxed_clean_ready,
         }
 
     # Suspicious должен требовать комбинацию сигналов, а не один слабый индикатор.
@@ -1995,10 +2009,12 @@ def build_pdf_verdict(
             "verdict_status": "suspicious",
             "verdict_text": SUSPICIOUS_RECEIPT_VERDICT_TEXT,
             "reasons": reasons,
+            "strict_clean_ready": strict_clean_ready,
+            "relaxed_clean_ready": relaxed_clean_ready,
         }
 
     # Clean только при достаточном покрытии и отсутствии заметных рисков.
-    clean_ready = (
+    strict_clean_ready = (
         quality_hits == 0 and
         core_supporting >= 3 and
         critical_found >= 5 and
@@ -2009,11 +2025,34 @@ def build_pdf_verdict(
         not too_few_supporting and
         not has_conflicts
     )
-    if clean_ready:
+    if strict_clean_ready:
         return {
             "verdict_status": "clean",
             "verdict_text": "✅ Признаков редактирования не обнаружено",
             "reasons": reasons,
+            "strict_clean_ready": strict_clean_ready,
+            "relaxed_clean_ready": relaxed_clean_ready,
+        }
+
+    relaxed_clean_ready = (
+        edit_score <= 1 and
+        template_score <= 1 and
+        suspicious_critical_lines == 0 and
+        not too_few_supporting and
+        not has_conflicts and
+        transaction_context_present and
+        core_supporting >= 4 and
+        critical_found >= 4 and
+        quality_hits <= 1 and
+        (receipt_format_type in {"image_pdf", "mixed_pdf"} or "ocr_used" in limitation_set)
+    )
+    if relaxed_clean_ready:
+        return {
+            "verdict_status": "clean",
+            "verdict_text": "✅ Признаков редактирования не обнаружено",
+            "reasons": reasons,
+            "strict_clean_ready": strict_clean_ready,
+            "relaxed_clean_ready": relaxed_clean_ready,
         }
 
     reasons.append("insufficient_confidence_for_clean")
@@ -2021,6 +2060,8 @@ def build_pdf_verdict(
         "verdict_status": "inconclusive",
         "verdict_text": LIMITED_ANALYSIS_VERDICT_TEXT,
         "reasons": reasons,
+        "strict_clean_ready": strict_clean_ready,
+        "relaxed_clean_ready": relaxed_clean_ready,
     }
 
 
@@ -3084,7 +3125,7 @@ def analyze_pdf_structured(file_path: str) -> PdfAnalysisResult:
         verdict = verdict_info["verdict_text"]
 
         logger.info(
-            "PDF final verdict=%s reasons=%s edit_score=%s template_score=%s core_supporting=%s critical_found=%s suspicious_critical_lines=%s too_few_supporting=%s conflicting_amount=%s conflicting_date=%s operation_id_found=%s tx_context=%s format=%s native_len=%s ocr_used=%s ocr_len=%s ocr_processed=%s ocr_with_text=%s limitations=%s file=%s",
+            "PDF final verdict=%s reasons=%s edit_score=%s template_score=%s core_supporting=%s critical_found=%s suspicious_critical_lines=%s too_few_supporting=%s conflicting_amount=%s conflicting_date=%s operation_id_found=%s tx_context=%s strict_clean_ready=%s relaxed_clean_ready=%s format=%s native_len=%s ocr_used=%s ocr_len=%s ocr_processed=%s ocr_with_text=%s limitations=%s file=%s",
             verdict_status,
             ",".join(verdict_reasons[:5]) if verdict_reasons else "-",
             score,
@@ -3097,6 +3138,8 @@ def analyze_pdf_structured(file_path: str) -> PdfAnalysisResult:
             int(bool(critical_summary.get("conflicting_date_candidates"))),
             int(bool(critical_summary.get("operation_id_found"))),
             int(bool(critical_summary.get("transaction_context_present"))),
+            int(bool(verdict_info.get("strict_clean_ready"))),
+            int(bool(verdict_info.get("relaxed_clean_ready"))),
             receipt_format_type,
             len(native_text),
             int(ocr_used),
@@ -3538,8 +3581,7 @@ async def handle_receipt_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
                 )
                 await status.edit_text(
                     "❌ Не удалось распознать файл как PDF-чек.\n"
-                    "Отправь платёжный чек в формате PDF.",
-                    reply_markup=build_menu(is_admin_user(update), get_mode(context))
+                    "Отправь платёжный чек в формате PDF."
                 )
                 return
             summary = prefetched_result.critical_fields_summary or {}
@@ -3557,8 +3599,7 @@ async def handle_receipt_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
         if not access["allowed"]:
             await status.edit_text(
                 await build_no_receipt_access_text(user.id, context.bot),
-                parse_mode="HTML",
-                reply_markup=build_menu(is_admin_user(update), get_mode(context))
+                parse_mode="HTML"
             )
             return
 
