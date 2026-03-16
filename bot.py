@@ -1212,7 +1212,7 @@ async def set_pan_flag(h: str, user_id: int, is_problem: bool):
 # PDF check helpers
 # =========================
 AMOUNT_PATTERN = re.compile(
-    r'(?<!\d)(\d{1,3}(?:[\s.,]\d{3})*(?:[\s.,]\d{2})?)\s?(₽|RUB|руб|Руб|р\.?|KZT|₸|тенге|UZS|сум|TJS|сомони|KGS|сом|BYN|Br|AMD|֏|AZN|₼|GEL|₾|USD|\$|EUR|€)',
+    r'(?<!\d)(\d{1,3}(?:[\s.,]\d{3})*(?:[\s.,]\d{2})?)\s?(₽|RUB|руб|Руб|р\.?|KZT|₸|тенге|UZS|сум|TJS|сомони|KGS|сом|BYN|Br|AMD|֏|AZN|₼|GEL|₾|USD|\$|EUR|€|UAH|грн|₴)',
     flags=re.IGNORECASE
 )
 DATE_PATTERN = re.compile(r'\b(?:\d{2}[./-]\d{2}[./-]\d{2,4}|\d{4}[./-]\d{2}[./-]\d{2})\b')
@@ -1238,7 +1238,7 @@ STATUS_PATTERN = re.compile(
     flags=re.IGNORECASE
 )
 CURRENCY_TOKEN_PATTERN = re.compile(
-    r'\b(?:RUB|KZT|UZS|TJS|KGS|BYN|AMD|AZN|GEL|USD|EUR|руб|р\.?|тенге|сум|сом|сомони|Br)\b|[₽₸֏₼₾$€]',
+    r'\b(?:RUB|KZT|UZS|TJS|KGS|BYN|AMD|AZN|GEL|USD|EUR|UAH|руб|р\.?|тенге|сум|сом|сомони|грн|Br)\b|[₽₸֏₼₾₴$€]',
     flags=re.IGNORECASE
 )
 TRANSACTION_CONTEXT_PATTERN = re.compile(
@@ -2024,6 +2024,7 @@ def is_pdf_receipt_like(file_path: str) -> bool:
         doc = fitz.open(file_path)
         native_text = collect_native_text(doc)
         text = native_text.lower()
+        native_text_len = len(text.strip())
         format_type, format_stats = _detect_receipt_format_type(doc, native_text)
         hits, found_groups = _receipt_semantic_groups_hits(text) if text else (0, set())
         entities = extract_receipt_entities(text) if text else extract_receipt_entities("")
@@ -2094,6 +2095,32 @@ def is_pdf_receipt_like(file_path: str) -> bool:
                 has_strong_doc_context and
                 (hits >= 2 or core_semantic_hits >= 2)
             )
+
+        # OCR-assisted fallback только для image_pdf / слабого mixed_pdf с почти пустым native text.
+        # Это позволяет пропустить реальные image-only чеки в основной анализ, не открывая широкий допуск.
+        weak_mixed_pdf = format_type == "mixed_pdf" and native_text_len < 40 and core_semantic_hits <= 1
+        if is_document_like and native_text_len < 24 and (format_type == "image_pdf" or weak_mixed_pdf):
+            ocr_info = extract_text_with_ocr(file_path, doc, max_pages=2)
+            ocr_text = safe_str(ocr_info.get("ocr_text"))
+            if ocr_text:
+                ocr_lower = ocr_text.lower()
+                ocr_hits, ocr_groups = _receipt_semantic_groups_hits(ocr_lower)
+                ocr_entities = extract_receipt_entities(ocr_text)
+
+                ocr_has_amount = bool(ocr_entities.get("amounts")) or "amount" in ocr_groups
+                ocr_strong_signals = sum(
+                    int(v) for v in (
+                        bool(ocr_entities.get("dates")),
+                        bool(ocr_entities.get("times")),
+                        bool(ocr_entities.get("statuses")),
+                        bool(ocr_entities.get("operation_ids")),
+                        bool(ocr_entities.get("transaction_context_present")),
+                        "receipt" in ocr_groups,
+                        "operation" in ocr_groups,
+                    )
+                )
+                if ocr_has_amount and (ocr_strong_signals >= 2 or (ocr_strong_signals >= 1 and ocr_hits >= 3)):
+                    return True
 
         # mixed_pdf: недостаточно "похожести на документ"; нужна хотя бы минимальная семантика.
         if format_type == "mixed_pdf":
@@ -2572,7 +2599,7 @@ def _default_ocr_result() -> dict:
     }
 
 
-def extract_text_with_ocr(file_path: str, doc: fitz.Document) -> dict:
+def extract_text_with_ocr(file_path: str, doc: fitz.Document, max_pages: int = 4) -> dict:
     _ = file_path
     result = _default_ocr_result()
 
@@ -2593,7 +2620,8 @@ def extract_text_with_ocr(file_path: str, doc: fitz.Document) -> dict:
     parts = []
     pages_processed = 0
     pages_with_text = 0
-    max_pages = min(len(doc), 4)
+    max_pages = max(1, int(max_pages or 1))
+    max_pages = min(len(doc), max_pages)
     if len(doc) > max_pages:
         result["ocr_limitations"].append("ocr_page_limit_applied")
 
