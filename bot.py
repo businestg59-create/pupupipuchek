@@ -1250,6 +1250,11 @@ OPERATION_ID_CAPTURE_PATTERN = re.compile(
     r'[:\s#-]*([A-Z0-9-]{3,40})?',
     flags=re.IGNORECASE
 )
+TEXT_OPERATION_ID_CAPTURE_PATTERN = re.compile(
+    r'\b(?:номер\s*документа|код\s*авторизац(?:ии|ия)|идентификатор\s*операции|номер\s*операции)\b'
+    r'[:\s#-]*([A-Z0-9-]{3,40})',
+    flags=re.IGNORECASE
+)
 
 # Критические поля для forensic-проверки: их чаще всего точечно подменяют в чеке.
 # Важно: наличие этих слов само по себе не подозрительно и не повышает score.
@@ -1481,6 +1486,30 @@ def _normalize_amount_candidate(value: str) -> str:
     return re.sub(r"[^\d]", "", num)
 
 
+def _amount_line_context(text: str, start: int, end: int) -> str:
+    src = safe_str(text)
+    left = src.rfind("\n", 0, start)
+    right = src.find("\n", end)
+    line_start = 0 if left < 0 else left + 1
+    line_end = len(src) if right < 0 else right
+    return src[line_start:line_end]
+
+
+def _amount_context_kind(line_text: str) -> str:
+    line = normalize_text_for_match(line_text)
+    if not line:
+        return "other"
+    if re.search(r"\b(?:комисс|fee|service\s*fee|сервисн\w+\s*сбор)\b", line, flags=re.IGNORECASE):
+        return "fee"
+    if re.search(
+        r"\b(?:сумма\s*перевода|итого|к\s*оплате|на\s*сумму|списан\w*|списание|перевод|total|amount|debited|charged)\b",
+        line,
+        flags=re.IGNORECASE,
+    ):
+        return "transfer"
+    return "other"
+
+
 def _normalize_date_candidate(value: str) -> str:
     raw = safe_str(value).strip()
     m = re.match(r"^(\d{2,4})[./-](\d{2})[./-](\d{2,4})$", raw)
@@ -1612,13 +1641,41 @@ def extract_receipt_entities(text: str) -> dict:
             "iban_like": [],
             "phone_like": [],
             "operation_labels_present": False,
+            "operation_id_source": "none",
             "transaction_context_present": False,
             "receipt_like_context_present": False,
+            "amount_kind_by_normalized": {},
         }
 
-    amounts = [m.group(0).strip() for m in AMOUNT_PATTERN.finditer(src)]
-    if not amounts:
-        amounts = _extract_contextual_amount_candidates(src)
+    amount_entries: list[tuple[str, str]] = []
+    for m in AMOUNT_PATTERN.finditer(src):
+        raw_amount = m.group(0).strip()
+        if not raw_amount:
+            continue
+        context_line = _amount_line_context(src, m.start(), m.end())
+        amount_entries.append((raw_amount, _amount_context_kind(context_line)))
+    if not amount_entries:
+        fallback_amounts = _extract_contextual_amount_candidates(src)
+        for value in fallback_amounts:
+            kind = "other"
+            for line in src.splitlines():
+                if value not in line:
+                    continue
+                if not CONTEXTUAL_AMOUNT_KEYWORD_PATTERN.search(line):
+                    continue
+                kind = _amount_context_kind(line)
+                break
+            amount_entries.append((value, kind))
+    amounts = [value for value, _ in amount_entries]
+
+    amount_kind_by_normalized: dict[str, set[str]] = {}
+    for value, kind in amount_entries:
+        norm = _normalize_amount_candidate(value)
+        if not norm:
+            continue
+        kinds = amount_kind_by_normalized.setdefault(norm, set())
+        kinds.add(kind or "other")
+
     currencies = _extract_currency_candidates(src)
     dates = DATE_PATTERN.findall(src)
     times = TIME_PATTERN.findall(src)
@@ -1650,6 +1707,7 @@ def extract_receipt_entities(text: str) -> dict:
 
     operation_ids = []
     operation_labels_present = False
+    operation_id_sources: set[str] = set()
     for m in OPERATION_ID_CAPTURE_PATTERN.finditer(src):
         operation_labels_present = True
         candidate = safe_str(m.group(1)).strip(":-# ")
@@ -1657,6 +1715,17 @@ def extract_receipt_entities(text: str) -> dict:
             continue
         if _is_valid_operation_id_candidate(candidate, strict=True):
             operation_ids.append(candidate)
+            operation_id_sources.add("default_label")
+
+    for m in TEXT_OPERATION_ID_CAPTURE_PATTERN.finditer(src):
+        operation_labels_present = True
+        candidate = safe_str(m.group(1)).strip(":-# ")
+        if not candidate:
+            continue
+        # Explicit label source for text receipts: allow numeric values when label is strong.
+        if _is_valid_operation_id_candidate(candidate, strict=True) or re.fullmatch(r"\d{6,24}", candidate):
+            operation_ids.append(candidate)
+            operation_id_sources.add("text_label")
 
     # Консервативный fallback: id-подобные токены только в контекстных строках.
     for line in src.splitlines():
@@ -1665,6 +1734,7 @@ def extract_receipt_entities(text: str) -> dict:
         for token in re.findall(r"\b[A-Z0-9-]{8,32}\b", line.upper()):
             if _is_valid_operation_id_candidate(token, strict=False):
                 operation_ids.append(token)
+                operation_id_sources.add("context_token")
 
     # Исключаем дублирование operation_id с account/iban/card-like реквизитами.
     blocked_ids = {
@@ -1676,6 +1746,8 @@ def extract_receipt_entities(text: str) -> dict:
         v for v in operation_ids
         if _normalize_compact(v) and _normalize_compact(v) not in blocked_ids
     ]
+    if not operation_ids:
+        operation_id_sources.clear()
 
     transaction_context_present = bool(TRANSACTION_CONTEXT_PATTERN.search(src))
     receipt_like_context_present = bool(re.search(r"\b(?:чек|receipt|квитан|invoice)\b", src, flags=re.IGNORECASE))
@@ -1692,8 +1764,10 @@ def extract_receipt_entities(text: str) -> dict:
         "iban_like": _unique_limited(iban_like),
         "phone_like": _unique_limited(phone_like),
         "operation_labels_present": operation_labels_present,
+        "operation_id_source": ",".join(sorted(operation_id_sources)) if operation_id_sources else "none",
         "transaction_context_present": transaction_context_present,
         "receipt_like_context_present": receipt_like_context_present,
+        "amount_kind_by_normalized": {k: sorted(v) for k, v in amount_kind_by_normalized.items()},
     }
 
 
@@ -1750,9 +1824,37 @@ def build_critical_fields_summary(forensic_summary: dict, entities: dict) -> dic
     supporting_fields_count = core_supporting_fields_count + auxiliary_supporting_fields_count
     too_few_supporting_fields = amount_found and core_supporting_fields_count <= 1 and auxiliary_supporting_fields_count <= 1
 
-    normalized_amounts = {_normalize_amount_candidate(v) for v in amount_candidates if _normalize_amount_candidate(v)}
+    def _is_zero_amount_norm(value: str) -> bool:
+        digits = re.sub(r"[^\d]", "", safe_str(value))
+        return bool(digits) and int(digits) == 0
+
+    normalized_amounts = [_normalize_amount_candidate(v) for v in amount_candidates if _normalize_amount_candidate(v)]
+    normalized_amount_candidates = sorted({v for v in normalized_amounts if v})
+    amount_kind_by_normalized = entities.get("amount_kind_by_normalized", {}) or {}
+    transfer_like_amounts = set()
+    fee_amounts = set()
+    for norm in normalized_amount_candidates:
+        kinds = {normalize_text_for_match(k) for k in amount_kind_by_normalized.get(norm, [])}
+        if "fee" in kinds:
+            fee_amounts.add(norm)
+        if "transfer" in kinds:
+            transfer_like_amounts.add(norm)
+
+    # Конфликт считаем только по реально разным transfer/total/debit суммам.
+    # Fee-суммы и нулевая комиссия не должны формировать конфликт перевода.
+    if transfer_like_amounts:
+        conflict_pool = transfer_like_amounts
+    else:
+        conflict_pool = {v for v in normalized_amount_candidates if v not in fee_amounts}
+
+    conflicting_amount_explained_by_fee_or_zero = False
+    if len(conflict_pool) <= 1 and len(set(normalized_amount_candidates)) >= 2:
+        zero_fee_present = any(v in fee_amounts and _is_zero_amount_norm(v) for v in normalized_amount_candidates)
+        non_fee_present = any(v not in fee_amounts for v in normalized_amount_candidates)
+        conflicting_amount_explained_by_fee_or_zero = zero_fee_present and non_fee_present
+
     normalized_dates = {_normalize_date_candidate(v) for v in date_candidates if _normalize_date_candidate(v)}
-    conflicting_amount_candidates = len(normalized_amounts) >= 2
+    conflicting_amount_candidates = len(conflict_pool) >= 2
     conflicting_date_candidates = len(normalized_dates) >= 2
 
     critical_fields_found_count = sum(
@@ -1790,6 +1892,7 @@ def build_critical_fields_summary(forensic_summary: dict, entities: dict) -> dic
         "operation_id_too_generic": operation_id_too_generic,
         "too_few_supporting_fields": too_few_supporting_fields,
         "conflicting_amount_candidates": conflicting_amount_candidates,
+        "conflicting_amount_explained_by_fee_or_zero": conflicting_amount_explained_by_fee_or_zero,
         "conflicting_date_candidates": conflicting_date_candidates,
         "supporting_fields_count": supporting_fields_count,
         "core_supporting_fields_count": core_supporting_fields_count,
@@ -1797,6 +1900,8 @@ def build_critical_fields_summary(forensic_summary: dict, entities: dict) -> dic
         "transaction_context_present": bool(entities.get("transaction_context_present")),
         "receipt_like_context_present": bool(entities.get("receipt_like_context_present")),
         "operation_labels_present": bool(entities.get("operation_labels_present")),
+        "operation_id_source": safe_str(entities.get("operation_id_source")) or "none",
+        "normalized_amount_candidates": normalized_amount_candidates,
     })
     return summary
 
@@ -1902,15 +2007,21 @@ def build_pdf_verdict(
     limitation_set = set(limitations or [])
     strict_clean_ready = False
     relaxed_clean_ready = False
+    text_pdf_relaxed_clean_ready = False
 
     suspicious_critical_lines = int(critical_summary.get("suspicious_critical_lines_total", 0) or 0)
     core_supporting = int(critical_summary.get("core_supporting_fields_count", 0) or 0)
     critical_found = int(critical_summary.get("critical_fields_found_count", 0) or 0)
     operation_id_found = bool(critical_summary.get("operation_id_found"))
+    amount_found = bool(critical_summary.get("amount_found"))
+    card_like_found = bool(critical_summary.get("card_like_found"))
+    account_like_found = bool(critical_summary.get("account_like_found"))
     transaction_context_present = bool(critical_summary.get("transaction_context_present"))
     too_few_supporting = bool(critical_summary.get("too_few_supporting_fields"))
     conflicting_amounts = bool(critical_summary.get("conflicting_amount_candidates"))
+    conflicting_amount_explained = bool(critical_summary.get("conflicting_amount_explained_by_fee_or_zero"))
     conflicting_dates = bool(critical_summary.get("conflicting_date_candidates"))
+    severe_limitations_present = bool(limitation_set.intersection({"analysis_error", "pdf_too_large"}))
 
     if edit_score >= 7:
         reasons.append("high_edit_score")
@@ -1920,6 +2031,7 @@ def build_pdf_verdict(
             "reasons": reasons,
             "strict_clean_ready": strict_clean_ready,
             "relaxed_clean_ready": relaxed_clean_ready,
+            "text_pdf_relaxed_clean_ready": text_pdf_relaxed_clean_ready,
         }
     # Сильная forensic-комбинация даже ниже основного порога.
     if edit_score >= 6 and suspicious_critical_lines >= 2:
@@ -1930,6 +2042,7 @@ def build_pdf_verdict(
             "reasons": reasons,
             "strict_clean_ready": strict_clean_ready,
             "relaxed_clean_ready": relaxed_clean_ready,
+            "text_pdf_relaxed_clean_ready": text_pdf_relaxed_clean_ready,
         }
 
     if "analysis_error" in limitation_set or "pdf_too_large" in limitation_set:
@@ -1940,6 +2053,7 @@ def build_pdf_verdict(
             "reasons": reasons,
             "strict_clean_ready": strict_clean_ready,
             "relaxed_clean_ready": relaxed_clean_ready,
+            "text_pdf_relaxed_clean_ready": text_pdf_relaxed_clean_ready,
         }
 
     quality_flags = {
@@ -1965,6 +2079,7 @@ def build_pdf_verdict(
             "reasons": reasons,
             "strict_clean_ready": strict_clean_ready,
             "relaxed_clean_ready": relaxed_clean_ready,
+            "text_pdf_relaxed_clean_ready": text_pdf_relaxed_clean_ready,
         }
 
     if (
@@ -1980,6 +2095,7 @@ def build_pdf_verdict(
             "reasons": reasons,
             "strict_clean_ready": strict_clean_ready,
             "relaxed_clean_ready": relaxed_clean_ready,
+            "text_pdf_relaxed_clean_ready": text_pdf_relaxed_clean_ready,
         }
 
     if "limited_text_extraction" in limitation_set and core_supporting == 0 and not transaction_context_present:
@@ -1990,6 +2106,7 @@ def build_pdf_verdict(
             "reasons": reasons,
             "strict_clean_ready": strict_clean_ready,
             "relaxed_clean_ready": relaxed_clean_ready,
+            "text_pdf_relaxed_clean_ready": text_pdf_relaxed_clean_ready,
         }
 
     # Suspicious должен требовать комбинацию сигналов, а не один слабый индикатор.
@@ -2011,6 +2128,7 @@ def build_pdf_verdict(
             "reasons": reasons,
             "strict_clean_ready": strict_clean_ready,
             "relaxed_clean_ready": relaxed_clean_ready,
+            "text_pdf_relaxed_clean_ready": text_pdf_relaxed_clean_ready,
         }
 
     # Clean только при достаточном покрытии и отсутствии заметных рисков.
@@ -2032,6 +2150,7 @@ def build_pdf_verdict(
             "reasons": reasons,
             "strict_clean_ready": strict_clean_ready,
             "relaxed_clean_ready": relaxed_clean_ready,
+            "text_pdf_relaxed_clean_ready": text_pdf_relaxed_clean_ready,
         }
 
     relaxed_clean_ready = (
@@ -2053,6 +2172,31 @@ def build_pdf_verdict(
             "reasons": reasons,
             "strict_clean_ready": strict_clean_ready,
             "relaxed_clean_ready": relaxed_clean_ready,
+            "text_pdf_relaxed_clean_ready": text_pdf_relaxed_clean_ready,
+        }
+
+    text_pdf_relaxed_clean_ready = (
+        receipt_format_type == "text_pdf" and
+        edit_score <= 1 and
+        template_score <= 1 and
+        suspicious_critical_lines == 0 and
+        transaction_context_present and
+        core_supporting >= 3 and
+        critical_found >= 4 and
+        not too_few_supporting and
+        not severe_limitations_present and
+        (amount_found or operation_id_found or card_like_found or account_like_found) and
+        not conflicting_dates and
+        (not conflicting_amounts or conflicting_amount_explained)
+    )
+    if text_pdf_relaxed_clean_ready:
+        return {
+            "verdict_status": "clean",
+            "verdict_text": "✅ Признаков редактирования не обнаружено",
+            "reasons": reasons,
+            "strict_clean_ready": strict_clean_ready,
+            "relaxed_clean_ready": relaxed_clean_ready,
+            "text_pdf_relaxed_clean_ready": text_pdf_relaxed_clean_ready,
         }
 
     reasons.append("insufficient_confidence_for_clean")
@@ -2062,6 +2206,7 @@ def build_pdf_verdict(
         "reasons": reasons,
         "strict_clean_ready": strict_clean_ready,
         "relaxed_clean_ready": relaxed_clean_ready,
+        "text_pdf_relaxed_clean_ready": text_pdf_relaxed_clean_ready,
     }
 
 
@@ -2110,7 +2255,6 @@ def is_pdf_receipt_like(file_path: str) -> bool:
         doc = fitz.open(file_path)
         native_text = collect_native_text(doc)
         text = native_text.lower()
-        native_text_len = len(text.strip())
         format_type, format_stats = _detect_receipt_format_type(doc, native_text)
         hits, found_groups = _receipt_semantic_groups_hits(text) if text else (0, set())
         entities = extract_receipt_entities(text) if text else extract_receipt_entities("")
@@ -3125,7 +3269,7 @@ def analyze_pdf_structured(file_path: str) -> PdfAnalysisResult:
         verdict = verdict_info["verdict_text"]
 
         logger.info(
-            "PDF final verdict=%s reasons=%s edit_score=%s template_score=%s core_supporting=%s critical_found=%s suspicious_critical_lines=%s too_few_supporting=%s conflicting_amount=%s conflicting_date=%s operation_id_found=%s tx_context=%s strict_clean_ready=%s relaxed_clean_ready=%s format=%s native_len=%s ocr_used=%s ocr_len=%s ocr_processed=%s ocr_with_text=%s limitations=%s file=%s",
+            "PDF final verdict=%s reasons=%s edit_score=%s template_score=%s core_supporting=%s critical_found=%s suspicious_critical_lines=%s too_few_supporting=%s conflicting_amount=%s conflicting_date=%s operation_id_found=%s tx_context=%s strict_clean_ready=%s relaxed_clean_ready=%s text_pdf_relaxed_clean_ready=%s operation_id_source=%s normalized_amount_candidates=%s format=%s native_len=%s ocr_used=%s ocr_len=%s ocr_processed=%s ocr_with_text=%s limitations=%s file=%s",
             verdict_status,
             ",".join(verdict_reasons[:5]) if verdict_reasons else "-",
             score,
@@ -3140,6 +3284,9 @@ def analyze_pdf_structured(file_path: str) -> PdfAnalysisResult:
             int(bool(critical_summary.get("transaction_context_present"))),
             int(bool(verdict_info.get("strict_clean_ready"))),
             int(bool(verdict_info.get("relaxed_clean_ready"))),
+            int(bool(verdict_info.get("text_pdf_relaxed_clean_ready"))),
+            safe_str(critical_summary.get("operation_id_source")) or "none",
+            ",".join([safe_str(v) for v in critical_summary.get("normalized_amount_candidates", [])][:6]) or "-",
             receipt_format_type,
             len(native_text),
             int(ocr_used),
@@ -3636,7 +3783,13 @@ async def handle_receipt_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
         await refund_receipt_access(user.id, access)
         err_text = "❌ Не удалось проверить PDF. Попробуй ещё раз."
         if status is not None:
-            await status.edit_text(err_text)
+            try:
+                await status.edit_text(err_text)
+            except Exception:
+                await update.message.reply_text(
+                    err_text,
+                    reply_markup=build_menu(is_admin_user(update), get_mode(context))
+                )
         else:
             await update.message.reply_text(
                 err_text,
