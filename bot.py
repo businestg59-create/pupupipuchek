@@ -2096,10 +2096,45 @@ def is_pdf_receipt_like(file_path: str) -> bool:
                 (hits >= 2 or core_semantic_hits >= 2)
             )
 
-        # OCR-assisted fallback только для image_pdf / слабого mixed_pdf с почти пустым native text.
-        # Это позволяет пропустить реальные image-only чеки в основной анализ, не открывая широкий допуск.
-        weak_mixed_pdf = format_type == "mixed_pdf" and native_text_len < 40 and core_semantic_hits <= 1
-        if is_document_like and native_text_len < 24 and (format_type == "image_pdf" or weak_mixed_pdf):
+        # mixed_pdf: недостаточно "похожести на документ"; нужна хотя бы минимальная семантика.
+        if format_type == "mixed_pdf":
+            if is_document_like:
+                if core_semantic_hits >= 2 and (has_amount_context or "operation" in found_groups):
+                    return True
+                if hits >= 3 and core_semantic_hits >= 1 and ("receipt" in found_groups or "operation" in found_groups):
+                    return True
+
+        # image_pdf: самый строгий fallback, чтобы не пропускать произвольные image-only PDF.
+        # Разрешаем только при совокупности строгой структуры + хотя бы слабого транзакционного сигнала.
+        if format_type == "image_pdf":
+            if is_document_like:
+                pages_total = int(format_stats.get("pages_total", 0) or 0)
+                image_ratio = float(format_stats.get("image_page_ratio", 0.0) or 0.0)
+                pages_with_text_blocks = int(format_stats.get("pages_with_text_blocks", 0) or 0)
+                total_image_blocks = int(format_stats.get("total_image_blocks", 0) or 0)
+                strict_image_structure = (
+                    pages_total <= 2 and
+                    image_ratio >= 0.85 and
+                    pages_with_text_blocks == 0 and
+                    1 <= total_image_blocks <= 6
+                )
+                if strict_image_structure and (
+                    core_semantic_hits >= 1 and (
+                        has_amount_context or
+                        "operation" in found_groups or
+                        "receipt" in found_groups
+                    )
+                ):
+                    return True
+
+        # Финальный OCR fallback перед итоговым отказом:
+        # ограниченный (до 2 страниц) и только при признаках потенциально релевантного документа.
+        ocr_candidate = (
+            is_document_like or
+            format_type in {"image_pdf", "mixed_pdf"} or
+            native_text_len < 80
+        )
+        if ocr_candidate:
             ocr_info = extract_text_with_ocr(file_path, doc, max_pages=2)
             ocr_text = safe_str(ocr_info.get("ocr_text"))
             if ocr_text:
@@ -2119,39 +2154,11 @@ def is_pdf_receipt_like(file_path: str) -> bool:
                         "operation" in ocr_groups,
                     )
                 )
-                if ocr_has_amount and (ocr_strong_signals >= 2 or (ocr_strong_signals >= 1 and ocr_hits >= 3)):
+                if ocr_has_amount and (
+                    ocr_strong_signals >= 2 or
+                    (ocr_strong_signals >= 1 and ocr_hits >= 3)
+                ):
                     return True
-
-        # mixed_pdf: недостаточно "похожести на документ"; нужна хотя бы минимальная семантика.
-        if format_type == "mixed_pdf":
-            if not is_document_like:
-                return False
-            if core_semantic_hits >= 2 and (has_amount_context or "operation" in found_groups):
-                return True
-            return hits >= 3 and core_semantic_hits >= 1 and ("receipt" in found_groups or "operation" in found_groups)
-
-        # image_pdf: самый строгий fallback, чтобы не пропускать произвольные image-only PDF.
-        # Разрешаем только при совокупности строгой структуры + хотя бы слабого транзакционного сигнала.
-        if format_type == "image_pdf":
-            if not is_document_like:
-                return False
-            pages_total = int(format_stats.get("pages_total", 0) or 0)
-            image_ratio = float(format_stats.get("image_page_ratio", 0.0) or 0.0)
-            pages_with_text_blocks = int(format_stats.get("pages_with_text_blocks", 0) or 0)
-            total_image_blocks = int(format_stats.get("total_image_blocks", 0) or 0)
-            strict_image_structure = (
-                pages_total <= 2 and
-                image_ratio >= 0.85 and
-                pages_with_text_blocks == 0 and
-                1 <= total_image_blocks <= 6
-            )
-            return strict_image_structure and (
-                core_semantic_hits >= 1 and (
-                    has_amount_context or
-                    "operation" in found_groups or
-                    "receipt" in found_groups
-                )
-            )
 
         return False
     except Exception:
