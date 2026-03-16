@@ -98,8 +98,8 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 # =========================
 SUPPORT_USERNAME = "@cashoutta1"
 NEWS_CHANNEL_URL = "https://t.me/bincheker_news"
-PRIVACY_URL = "https://telegra.ph/Politika-konfidencialnosti--card-bin-checkerbot-01-13"
-FAQ_URL = "https://telegra.ph/FAQ--WorkBin-Bot-01-13"
+PRIVACY_URL = "https://telegra.ph/Politika-konfidencialnosti---card-bin-checkerbot-03-16"
+FAQ_URL = "https://telegra.ph/FAQ---card-bin-checkerbot-03-16"
 
 SUPPORT_KB = InlineKeyboardMarkup([
     [InlineKeyboardButton("✉️ Контакты (сотрудничество)", url=f"https://t.me/{SUPPORT_USERNAME.lstrip('@')}")],
@@ -662,7 +662,6 @@ def build_receipt_access_lines(access_status: dict) -> list[str]:
 def build_unlimited_offer_lines() -> list[str]:
     return [
         f"♾️ Безлимит на {UNLIMITED_PLAN_DAYS} дней — {UNLIMITED_PRICE_USDT} USDT",
-        "Оплата временно принимается в USDT",
         f"Для активации: {SUPPORT_USERNAME}",
     ]
 
@@ -2079,24 +2078,21 @@ def is_pdf_receipt_like(file_path: str) -> bool:
                 return True
 
             # Осторожный fallback для кривого text extraction:
-            # требуем сумму + комбинацию ключевых транзакционных сигналов.
+            # требуем сумму + явный признак транзакционного/чекового контекста.
             has_amount = bool(entities.get("amounts")) or "amount" in found_groups
-            has_temporal = bool(entities.get("dates")) or bool(entities.get("times")) or "date_time" in found_groups
-            has_tx_context = (
+            has_strong_doc_context = (
                 bool(entities.get("transaction_context_present")) or
                 bool(entities.get("operation_ids")) or
-                "operation" in found_groups
+                bool(entities.get("receipt_like_context_present")) or
+                bool(entities.get("statuses")) or
+                "operation" in found_groups or
+                "receipt" in found_groups
             )
-            has_status = bool(entities.get("statuses"))
-            has_receipt_group = "receipt" in found_groups
 
             return (
                 has_amount and
-                hits >= 2 and
-                (
-                    (has_temporal and (has_tx_context or has_status)) or
-                    (has_tx_context and (has_status or has_receipt_group))
-                )
+                has_strong_doc_context and
+                (hits >= 2 or core_semantic_hits >= 2)
             )
 
         # mixed_pdf: недостаточно "похожести на документ"; нужна хотя бы минимальная семантика.
