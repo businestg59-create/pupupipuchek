@@ -2525,6 +2525,44 @@ class PdfAnalysisResult:
     verdict: str = "inconclusive"
 
 
+def is_structured_pdf_receipt_candidate(result: PdfAnalysisResult) -> bool:
+    if not result:
+        return False
+
+    limitations = set(result.limitations or [])
+    if "analysis_error" in limitations or "pdf_too_large" in limitations:
+        return False
+
+    summary = result.critical_fields_summary or {}
+    core_supporting = int(summary.get("core_supporting_fields_count", 0) or 0)
+    critical_found = int(summary.get("critical_fields_found_count", 0) or 0)
+    too_few_supporting = bool(summary.get("too_few_supporting_fields"))
+    transaction_signal = any(
+        (
+            bool(summary.get("transaction_context_present")),
+            bool(summary.get("operation_id_found")),
+            bool(summary.get("receipt_like_context_present")),
+        )
+    )
+
+    coverage_relaxed = not too_few_supporting
+    if not coverage_relaxed:
+        coverage_relaxed = (core_supporting >= 3) or (critical_found >= 6)
+
+    if result.verdict_status == "clean" and coverage_relaxed and (
+        core_supporting >= 2 or critical_found >= 4
+    ):
+        return True
+
+    if core_supporting >= 2 and transaction_signal and coverage_relaxed:
+        return True
+
+    if critical_found >= 5 and core_supporting >= 2 and coverage_relaxed:
+        return True
+
+    return False
+
+
 def _detect_receipt_format_type(doc: fitz.Document, native_text: str) -> tuple[str, dict]:
     pages_total = len(doc)
     pages_with_native_text = 0
@@ -3466,6 +3504,7 @@ async def handle_receipt_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
     tmp_path = None
     status = None
     access = None
+    prefetched_result = None
     try:
         tg_file = await context.bot.get_file(document.file_id)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
@@ -3474,12 +3513,14 @@ async def handle_receipt_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
         await tg_file.download_to_drive(custom_path=tmp_path)
 
         if not is_pdf_receipt_like(tmp_path):
-            await update.message.reply_text(
-                "❌ Не удалось распознать файл как PDF-чек.\n"
-                "Отправь платёжный чек в формате PDF.",
-                reply_markup=build_menu(is_admin_user(update), get_mode(context))
-            )
-            return
+            prefetched_result = analyze_pdf_structured(tmp_path)
+            if not is_structured_pdf_receipt_candidate(prefetched_result):
+                await update.message.reply_text(
+                    "❌ Не удалось распознать файл как PDF-чек.\n"
+                    "Отправь платёжный чек в формате PDF.",
+                    reply_markup=build_menu(is_admin_user(update), get_mode(context))
+                )
+                return
 
         # Invariant: non-PDF and oversized files never consume quota.
         # Pre-check runs before consume; quota is consumed only for valid receipt-like PDFs.
@@ -3494,7 +3535,7 @@ async def handle_receipt_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         status = await update.message.reply_text("⏳ Проверяю PDF...")
         fire_and_forget(asyncio.create_task(track_event_bg(user.id, user.username, "receipt_request")))
-        result = analyze_pdf_structured(tmp_path)
+        result = prefetched_result or analyze_pdf_structured(tmp_path)
         inviter_user_id = await mark_referral_qualified_and_reward(user.id)
 
         await status.edit_text(
