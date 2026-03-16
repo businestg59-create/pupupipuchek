@@ -1242,7 +1242,7 @@ CURRENCY_TOKEN_PATTERN = re.compile(
     flags=re.IGNORECASE
 )
 TRANSACTION_CONTEXT_PATTERN = re.compile(
-    r'\b(?:transaction|payment|operation|reference|rrn|auth(?:\s*code)?|order|операц|перевод|платеж|чек|receipt|invoice)\b',
+    r'\b(?:transaction|payment|operation|reference|rrn|auth(?:\s*code)?|order|операц|перевод(?:\s+клиенту)?|платеж|чек|receipt|invoice|kaspi|каспи|получател\w*|отправител\w*|recipient|sender)\b',
     flags=re.IGNORECASE
 )
 OPERATION_ID_CAPTURE_PATTERN = re.compile(
@@ -1509,6 +1509,49 @@ def _extract_currency_candidates(text: str) -> list[str]:
     return _unique_limited(candidates)
 
 
+CONTEXTUAL_AMOUNT_KEYWORD_PATTERN = re.compile(
+    r'\b(?:сумма|сумма\s+перевода|итого|к\s*оплате|на\s*сумму|amount|total|transfer\s+amount)\b',
+    flags=re.IGNORECASE
+)
+CONTEXTUAL_AMOUNT_NUMBER_PATTERN = re.compile(
+    r'(?<!\d)(?:\d{1,3}(?:[\s\u00a0.,]\d{3})+(?:[.,]\d{2})?|\d{1,7}[.,]\d{2}|\d{3,7})(?!\d)'
+)
+
+
+def _extract_contextual_amount_candidates(text: str) -> list[str]:
+    candidates: list[str] = []
+    for line in safe_str(text).splitlines():
+        normalized_line = safe_str(line)
+        if not normalized_line.strip():
+            continue
+        if not CONTEXTUAL_AMOUNT_KEYWORD_PATTERN.search(normalized_line):
+            continue
+
+        keyword_positions = [m.start() for m in CONTEXTUAL_AMOUNT_KEYWORD_PATTERN.finditer(normalized_line)]
+        for number_match in CONTEXTUAL_AMOUNT_NUMBER_PATTERN.finditer(normalized_line):
+            start, end = number_match.span()
+            if keyword_positions and min(abs(start - pos) for pos in keyword_positions) > 28:
+                continue
+
+            nearby = normalized_line[max(0, start - 8): min(len(normalized_line), end + 8)]
+            if DATE_PATTERN.search(nearby) or TIME_PATTERN.search(nearby):
+                continue
+            if re.search(r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}", nearby):
+                continue
+            guard_window = normalized_line[max(0, start - 24): min(len(normalized_line), end + 24)]
+            if re.search(
+                r"\b(?:phone|телефон|id|reference|rrn|order|txn|auth|код|номер\s*операции)\b",
+                guard_window,
+                flags=re.IGNORECASE,
+            ):
+                continue
+
+            candidate = number_match.group(0).strip()
+            if candidate:
+                candidates.append(candidate)
+    return _unique_limited(candidates)
+
+
 def _is_generic_operation_id(value: str) -> bool:
     compact = _normalize_compact(value)
     if not compact:
@@ -1574,6 +1617,8 @@ def extract_receipt_entities(text: str) -> dict:
         }
 
     amounts = [m.group(0).strip() for m in AMOUNT_PATTERN.finditer(src)]
+    if not amounts:
+        amounts = _extract_contextual_amount_candidates(src)
     currencies = _extract_currency_candidates(src)
     dates = DATE_PATTERN.findall(src)
     times = TIME_PATTERN.findall(src)
@@ -2124,39 +2169,6 @@ def is_pdf_receipt_like(file_path: str) -> bool:
                         "operation" in found_groups or
                         "receipt" in found_groups
                     )
-                ):
-                    return True
-
-        # Финальный OCR fallback перед итоговым отказом:
-        # ограниченный (до 2 страниц) и только при признаках потенциально релевантного документа.
-        ocr_candidate = (
-            is_document_like or
-            format_type in {"image_pdf", "mixed_pdf"} or
-            native_text_len < 80
-        )
-        if ocr_candidate:
-            ocr_info = extract_text_with_ocr(file_path, doc, max_pages=2)
-            ocr_text = safe_str(ocr_info.get("ocr_text"))
-            if ocr_text:
-                ocr_lower = ocr_text.lower()
-                ocr_hits, ocr_groups = _receipt_semantic_groups_hits(ocr_lower)
-                ocr_entities = extract_receipt_entities(ocr_text)
-
-                ocr_has_amount = bool(ocr_entities.get("amounts")) or "amount" in ocr_groups
-                ocr_strong_signals = sum(
-                    int(v) for v in (
-                        bool(ocr_entities.get("dates")),
-                        bool(ocr_entities.get("times")),
-                        bool(ocr_entities.get("statuses")),
-                        bool(ocr_entities.get("operation_ids")),
-                        bool(ocr_entities.get("transaction_context_present")),
-                        "receipt" in ocr_groups,
-                        "operation" in ocr_groups,
-                    )
-                )
-                if ocr_has_amount and (
-                    ocr_strong_signals >= 2 or
-                    (ocr_strong_signals >= 1 and ocr_hits >= 3)
                 ):
                     return True
 
@@ -3511,29 +3523,45 @@ async def handle_receipt_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
             tmp_path = tmp.name
 
         await tg_file.download_to_drive(custom_path=tmp_path)
+        status = await update.message.reply_text("⏳ Проверяю PDF...")
 
         if not is_pdf_receipt_like(tmp_path):
             prefetched_result = analyze_pdf_structured(tmp_path)
             if not is_structured_pdf_receipt_candidate(prefetched_result):
-                await update.message.reply_text(
+                summary = prefetched_result.critical_fields_summary or {}
+                logger.info(
+                    "PDF precheck failed and structured fallback rejected verdict=%s core_supporting=%s critical_found=%s file=%s",
+                    prefetched_result.verdict_status,
+                    int(summary.get("core_supporting_fields_count", 0) or 0),
+                    int(summary.get("critical_fields_found_count", 0) or 0),
+                    os.path.basename(tmp_path),
+                )
+                await status.edit_text(
                     "❌ Не удалось распознать файл как PDF-чек.\n"
                     "Отправь платёжный чек в формате PDF.",
                     reply_markup=build_menu(is_admin_user(update), get_mode(context))
                 )
                 return
+            summary = prefetched_result.critical_fields_summary or {}
+            logger.info(
+                "PDF precheck failed but structured fallback accepted verdict=%s core_supporting=%s critical_found=%s file=%s",
+                prefetched_result.verdict_status,
+                int(summary.get("core_supporting_fields_count", 0) or 0),
+                int(summary.get("critical_fields_found_count", 0) or 0),
+                os.path.basename(tmp_path),
+            )
 
         # Invariant: non-PDF and oversized files never consume quota.
         # Pre-check runs before consume; quota is consumed only for valid receipt-like PDFs.
         access = await consume_receipt_access(user.id)
         if not access["allowed"]:
-            await update.message.reply_text(
+            await status.edit_text(
                 await build_no_receipt_access_text(user.id, context.bot),
                 parse_mode="HTML",
                 reply_markup=build_menu(is_admin_user(update), get_mode(context))
             )
             return
 
-        status = await update.message.reply_text("⏳ Проверяю PDF...")
         fire_and_forget(asyncio.create_task(track_event_bg(user.id, user.username, "receipt_request")))
         result = prefetched_result or analyze_pdf_structured(tmp_path)
         inviter_user_id = await mark_referral_qualified_and_reward(user.id)
